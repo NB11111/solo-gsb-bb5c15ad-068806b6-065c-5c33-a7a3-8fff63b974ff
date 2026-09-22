@@ -19,6 +19,7 @@ from .engine import (
     FootprintAnalysisError,
     ImpactAnalysisError,
     RulesetCompileError,
+    build_coverage,
     compare_results,
     compile_ruleset,
     decision_diff,
@@ -30,6 +31,8 @@ from .schemas import (
     BatchEvaluationOut,
     CompareOut,
     CompareRequest,
+    CoverageOut,
+    CoverageRequest,
     ErrorResponse,
     EvaluateBatchRequest,
     EvaluateRequest,
@@ -501,6 +504,75 @@ def evaluate_batch(
         "error_count": error_count,
         "results": results,
     }
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/coverage",
+    response_model=CoverageOut,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}},
+)
+def ruleset_coverage(
+    ruleset_id: str,
+    req: CoverageRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """多文档覆盖分析：逐项无落库求值并隔离失败，汇总覆盖与贪心代表输入。
+
+    整批固定使用请求指定的不可变 ``version``（只解析编译一次），每份文档
+    独立求值且**不写入 evaluations**。单项失败只记录在该项的 error 中（按
+    原下标返回），不产生覆盖单元、不参与代表选择，也不中止其余项。
+
+    以每份成功结果的 ``fired_rule_codes`` 与 ``conflicts`` 中的
+    “组/字段 + 胜出方 + 被压制规则”构造覆盖单元，汇总：全部规则的命中
+    次数、从未命中的规则、去重后的已观察冲突场景；再按“每轮新增覆盖单元
+    最多、并列取最小输入下标”的确定性贪心选出 representative_indexes，
+    直至无新增覆盖。规则集/版本不存在分别返回 404。
+    """
+    row = crud.get_ruleset(conn, ruleset_id)
+    if row is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+
+    try:
+        _snapshot, compiled = _load_compiled(conn, ruleset_id, req.version)
+    except LookupError:
+        return _error("VERSION_NOT_FOUND", f"版本 {req.version} 不存在", 404)
+
+    outcomes: list[dict[str, Any]] = []
+    for index, document in enumerate(req.documents):
+        try:
+            result = evaluate(compiled, document)
+        except EvaluationFailed as exc:
+            outcomes.append(
+                {
+                    "index": index,
+                    "status": "error",
+                    "result": None,
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "details": exc.details,
+                    },
+                }
+            )
+        except Exception as exc:  # 单项失败隔离，不中止整批且不落库
+            outcomes.append(
+                {
+                    "index": index,
+                    "status": "error",
+                    "result": None,
+                    "error": {
+                        "code": "EVALUATION_ERROR",
+                        "message": f"文档求值失败：{exc}",
+                        "details": {},
+                    },
+                }
+            )
+        else:
+            outcomes.append({"index": index, "status": "success", "result": result})
+
+    summary = build_coverage(compiled.evaluation_order, outcomes)
+    return {"ruleset_id": ruleset_id, "version": req.version, **summary}
 
 
 @app.post(

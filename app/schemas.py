@@ -139,6 +139,111 @@ class EvaluationOut(BaseModel):
     created_at: str
 
 
+class CoverageRequest(BaseModel):
+    version: int = Field(
+        ..., ge=1, description="分析所基于的规则版本（必填，不可变快照）"
+    )
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="待评估文档数组，1～100 项",
+    )
+
+
+class CoverageUnitOut(BaseModel):
+    kind: Literal["rule", "group", "field"] = Field(
+        ..., description="rule=规则命中；group=冲突组裁决；field=同名字段覆盖"
+    )
+    rule_code: str | None = Field(None, description="kind=rule 时的规则编码")
+    group: str | None = Field(None, description="kind=group 时的冲突组名")
+    field: str | None = Field(None, description="kind=field 时被覆盖的决策字段名")
+    winner: str | None = Field(None, description="group 胜出方 / field 的最终写入方")
+    previous_winner: str | None = Field(
+        None, description="kind=field 时覆盖前的写入规则；其余为 null"
+    )
+    suppressed_rule_codes: list[str] = Field(
+        default_factory=list,
+        description="被压制规则编码（按编码排序；field 单元恒为空）",
+    )
+
+
+class ConflictScenarioOut(BaseModel):
+    kind: Literal["group", "field"]
+    group: str | None = Field(None, description="kind=group 时的冲突组名")
+    field: str | None = Field(None, description="kind=field 时被覆盖的字段名")
+    policy: str | None = Field(None, description="观察到该场景时的冲突策略")
+    winner: str | None = Field(None, description="group 胜出方 / field 最终写入方")
+    suppressed_rule_codes: list[str] = Field(
+        default_factory=list, description="被压制规则编码（按编码排序）"
+    )
+    previous_winner: str | None = Field(
+        None, description="field 覆盖前的写入规则；group 场景为 null"
+    )
+    reason: str | None = Field(
+        None, description="field 覆盖原因（如 field_overwritten）；group 场景为 null"
+    )
+    observed_count: int = Field(..., description="该场景在多少份成功文档中出现")
+    observed_at_indexes: list[int] = Field(
+        ..., description="出现该场景的输入下标（升序）"
+    )
+    coverage_units: list[CoverageUnitOut] = Field(
+        ..., description="该场景贡献的覆盖单元（含涉及规则的 rule 单元）"
+    )
+
+
+class RuleCoverageOut(BaseModel):
+    code: str = Field(..., description="规则编码（按 evaluation_order 排列）")
+    hit_count: int = Field(..., description="该规则在成功文档中的命中次数")
+    covered_by_indexes: list[int] = Field(
+        ..., description="命中该规则的成功项输入下标（升序）"
+    )
+
+
+class CoverageItemOut(BaseModel):
+    index: int = Field(..., description="对应输入 documents 中的下标")
+    status: Literal["success", "error"]
+    fired_rule_codes: list[str] = Field(
+        default_factory=list, description="成功项的命中规则（含被压制者）；失败项为空"
+    )
+    conflicts: list[dict[str, Any]] = Field(
+        default_factory=list, description="成功项观察到的原始冲突解释；失败项为空"
+    )
+    coverage_units: list[CoverageUnitOut] = Field(
+        default_factory=list, description="该项贡献的覆盖单元；失败项为空"
+    )
+    error: ErrorResponse | None = Field(
+        None, description="该项求值失败时的错误信息；不影响其他项与覆盖汇总"
+    )
+
+
+class CoverageOut(BaseModel):
+    ruleset_id: str
+    version: int = Field(..., description="整批实际使用的规则版本（不可变快照）")
+    total: int = Field(..., description="输入文档总数（1～100）")
+    success_count: int
+    error_count: int
+    rule_coverage: list[RuleCoverageOut] = Field(
+        ..., description="该版本全部规则的命中统计，按 evaluation_order 排列"
+    )
+    uncovered_rule_codes: list[str] = Field(
+        ..., description="所有成功文档均未命中的规则编码，按 evaluation_order 排列"
+    )
+    conflict_scenarios: list[ConflictScenarioOut] = Field(
+        ..., description="去重后的已观察冲突场景，按首次观察顺序排列"
+    )
+    representative_indexes: list[int] = Field(
+        ...,
+        description=(
+            "确定性贪心选出的代表输入下标：每轮新增覆盖单元最多、并列取最小下标，"
+            "直至无新增；失败项不参与选择"
+        ),
+    )
+    items: list[CoverageItemOut] = Field(
+        ..., description="逐项结果（含失败项错误），按原输入下标返回"
+    )
+
+
 class RecomputeRequest(BaseModel):
     document: Any | None = Field(
         None, description="为空则使用该规则集上一次决策的文档"

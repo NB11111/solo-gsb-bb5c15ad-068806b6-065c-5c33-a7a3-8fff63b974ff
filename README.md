@@ -21,6 +21,7 @@
 │   │   ├── ast_eval.py    # 基于 AST 的安全表达式求值（沙箱）
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
 │   │   ├── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
+│   │   ├── coverage.py    # 多文档覆盖分析：覆盖单元/冲突场景 + 贪心代表输入
 │   │   ├── impact.py      # 静态影响分析：反向依赖闭包 + 冲突组联动
 │   │   ├── footprint.py   # 静态输入足迹：doc 访问链 → RFC 6901 JSON Pointer
 │   │   └── diff.py        # 跨版本预演：决策 JSON 路径差异 + 命中规则/冲突摘要
@@ -187,6 +188,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
+| `POST` | `/api/rulesets/{id}/coverage` | 多文档覆盖分析（1～100 份，不落库）：命中/未命中规则、已观察冲突场景与贪心代表输入 |
 | `POST` | `/api/rulesets/{id}/compare` | 发布前预演：同一文档按两个版本求值（不落库），返回两版决策与差异摘要 |
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
 | `GET`  | `/api/rulesets/{id}/evaluation-stats` | 聚合已持久化决策：规则命中率与决策字段统计（支持 `version` / `since` / `until` 筛选） |
@@ -298,6 +300,150 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
 > 注意：批量接口在存在失败项时仍返回 **HTTP 200**，通过每项的
 > `status` / `error` 与顶层计数区分成败；仅当规则集或版本不存在等
 > 整批级问题发生时才返回 4xx。
+
+### 多文档覆盖分析
+
+`POST /api/rulesets/{id}/coverage` 用于在**一组样本文档上度量规则覆盖**：
+提交 1～100 份文档与一个**必填、不可变的 `version`**，服务只解析编译一次，
+对每份文档**逐项独立求值、全程不写入 evaluations**；单项求值失败只记录在
+该项 `error` 中（按原下标返回），不中止其余项，也不产生覆盖证据。
+
+覆盖单元（coverage unit）是一次成功求值中可观察到的最小证据，分三类：
+
+| `kind` | 身份构成 | 来源 |
+| --- | --- | --- |
+| `rule` | 规则编码 | `fired_rule_codes` 中的每条命中规则（含被压制者） |
+| `group` | 冲突组 + 胜出方 + 被压制规则编码集合（按编码排序） | `conflicts` 中 priority / first_hit 的整组裁决 |
+| `field` | 字段名 + 前写入方 + 最终写入方 | `conflicts` 中 collect_all 的同名字段覆盖 |
+
+冲突解释涉及的规则（胜出方、被压制方、字段覆盖前后写入方）同时以 `rule`
+单元计入；组内只有一条规则命中时同样产生一条“无被压制者”的 `group` 单元。
+
+响应字段：
+
+- `items`：逐项结果，按**原输入下标**返回。成功项回显 `fired_rule_codes`、
+  原始 `conflicts` 与该文档的全部 `coverage_units`；失败项这三者为空，
+  错误结构与批量接口一致（`NOT_CONVERGED` 等）；
+- `rule_coverage`：该版本**全部规则**（按 `evaluation_order` 排列）在成功
+  文档中的命中次数 `hit_count` 与命中文档下标 `covered_by_indexes`；
+- `uncovered_rule_codes`：所有成功文档均未命中的规则编码（按
+  `evaluation_order` 排列；失败文档不计入）；
+- `conflict_scenarios`：按覆盖单元身份**去重后的已观察冲突场景**，按首次
+  观察顺序排列；每项含组/字段、策略、胜出方、被压制规则、出现次数
+  `observed_count`、出现下标 `observed_at_indexes`（升序）以及该场景贡献的
+  `coverage_units`；
+- `representative_indexes`：**确定性贪心**选出的代表输入下标——每轮选择
+  “相对尚未覆盖集合新增覆盖单元最多”的成功项，并列时取**最小输入下标**，
+  直到没有任何成功项能带来新增覆盖为止；**失败项不参与选择**，因此全部
+  失败或全部零覆盖时为空列表。
+
+错误情况：规则集不存在 → **404** `NOT_FOUND`；版本不存在 → **404**
+`VERSION_NOT_FOUND`；缺少 `version`、`version<1`、`documents` 为空或超过
+100 项 → **422**。单项求值失败不改变 HTTP 状态码（仍为 200）。
+
+请求示例（`g` 组使用 priority：r_b 优先于 r_a；另有独立规则 r_c）：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/cov-groups/coverage \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "documents": [
+      {"x": 1},
+      {"x": 2},
+      {"y": true},
+      {"x": 2, "y": true}
+    ]
+  }' | python3 -m json.tool
+```
+
+响应示例（有省略）：
+
+```json
+{
+  "ruleset_id": "cov-groups",
+  "version": 1,
+  "total": 4,
+  "success_count": 4,
+  "error_count": 0,
+  "rule_coverage": [
+    {"code": "r_a", "hit_count": 3, "covered_by_indexes": [0, 1, 3]},
+    {"code": "r_b", "hit_count": 2, "covered_by_indexes": [1, 3]},
+    {"code": "r_c", "hit_count": 2, "covered_by_indexes": [2, 3]}
+  ],
+  "uncovered_rule_codes": [],
+  "conflict_scenarios": [
+    {
+      "kind": "group",
+      "group": "g",
+      "field": null,
+      "policy": "priority",
+      "winner": "r_a",
+      "suppressed_rule_codes": [],
+      "previous_winner": null,
+      "reason": null,
+      "observed_count": 1,
+      "observed_at_indexes": [0],
+      "coverage_units": [
+        {"kind": "rule", "rule_code": "r_a", "group": null, "field": null,
+         "winner": null, "previous_winner": null, "suppressed_rule_codes": []},
+        {"kind": "group", "rule_code": null, "group": "g", "field": null,
+         "winner": "r_a", "previous_winner": null, "suppressed_rule_codes": []}
+      ]
+    },
+    {
+      "kind": "group",
+      "group": "g",
+      "field": null,
+      "policy": "priority",
+      "winner": "r_b",
+      "suppressed_rule_codes": ["r_a"],
+      "observed_count": 2,
+      "observed_at_indexes": [1, 3],
+      "coverage_units": [
+        {"kind": "rule", "rule_code": "r_a"},
+        {"kind": "rule", "rule_code": "r_b"},
+        {"kind": "group", "group": "g", "winner": "r_b",
+         "suppressed_rule_codes": ["r_a"]}
+      ]
+    }
+  ],
+  "representative_indexes": [3, 0],
+  "items": [
+    {"index": 0, "status": "success",
+     "fired_rule_codes": ["r_a"],
+     "conflicts": [{"group": "g", "policy": "priority", "winner": "r_a",
+                    "suppressed": []}],
+     "coverage_units": [
+       {"kind": "rule", "rule_code": "r_a"},
+       {"kind": "group", "group": "g", "winner": "r_a",
+        "suppressed_rule_codes": []}
+     ],
+     "error": null}
+  ]
+}
+```
+
+上例的贪心过程：下标 3 一份文档同时覆盖 r_a/r_b/r_c 三条 rule 单元与
+`g→r_b 压制 r_a` 场景，首轮入选；剩余的 `g→r_a（无被压制）` 场景只在
+下标 0 出现，次轮入选；下标 1、2 不再带来新增覆盖。
+
+某项求值失败时（仍返回 HTTP 200）：
+
+```json
+{
+  "index": 1,
+  "status": "error",
+  "fired_rule_codes": [],
+  "conflicts": [],
+  "coverage_units": [],
+  "error": {
+    "code": "NOT_CONVERGED",
+    "message": "规则评估在 100 轮内未达到稳定状态",
+    "details": {"max_iterations": 100}
+  }
+}
+```
 
 ### 发布前跨版本预演
 
@@ -644,5 +790,7 @@ pytest -q
 拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合（筛选/排序/零值/非法参数）、
 静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422）、
 静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422）、
-跨版本预演（JSON 路径差异归并/空差异/冲突胜出方变化/求值失败单侧隔离/不落库/404 与 422），
+跨版本预演（JSON 路径差异归并/空差异/冲突胜出方变化/求值失败单侧隔离/不落库/404 与 422）、
+多文档覆盖分析（rule/group/field 覆盖单元/命中与未命中统计/冲突场景去重与观察下标/
+确定性贪心代表选择/失败项隔离且不参与选择/不落库/404 与 422），
 以及完整 HTTP 接口。
