@@ -14,6 +14,7 @@ from .compiler import (
     detect_cycle,
     topo_order,
 )
+from .coverage import extract_coverage_units, summarize_coverage
 from .diff import compare_results, conflict_diff, decision_diff, list_diff
 from .evaluator import EvaluationFailed, evaluate
 from .footprint import FootprintAnalysisError, input_footprint
@@ -32,6 +33,8 @@ __all__ = [
     "topo_order",
     "EvaluationFailed",
     "evaluate",
+    "extract_coverage_units",
+    "summarize_coverage",
     "compare_results",
     "conflict_diff",
     "decision_diff",

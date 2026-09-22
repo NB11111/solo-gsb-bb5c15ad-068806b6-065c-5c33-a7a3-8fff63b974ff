@@ -23,13 +23,17 @@ from .engine import (
     compile_ruleset,
     decision_diff,
     evaluate,
+    extract_coverage_units,
     impact_analysis,
     input_footprint,
+    summarize_coverage,
 )
 from .schemas import (
     BatchEvaluationOut,
     CompareOut,
     CompareRequest,
+    CoverageOut,
+    CoverageRequest,
     ErrorResponse,
     EvaluateBatchRequest,
     EvaluateRequest,
@@ -500,6 +504,95 @@ def evaluate_batch(
         "success_count": success_count,
         "error_count": error_count,
         "results": results,
+    }
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/coverage",
+    response_model=CoverageOut,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}},
+)
+def evaluate_coverage(
+    ruleset_id: str,
+    req: CoverageRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """批量覆盖分析：指定不可变 version，逐项不落库求值并隔离失败。
+
+    以每份成功结果中的 fired_rule_codes（规则命中单元）与 conflicts
+    （冲突组压制 / collect_all 字段覆盖单元）构造覆盖单元，汇总全部规则
+    的命中次数、未命中规则、已观察冲突场景，并按“每轮新增覆盖单元最多、
+    并列取最小输入下标”的确定性贪心选出 representative_indexes，直至
+    无新增覆盖。失败项不参与选择但按原下标返回错误；分析过程不写入
+    evaluations。
+    """
+    row = crud.get_ruleset(conn, ruleset_id)
+    if row is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+
+    try:
+        _snapshot, compiled = _load_compiled(conn, ruleset_id, req.version)
+    except LookupError:
+        return _error("VERSION_NOT_FOUND", f"版本 {req.version} 不存在", 404)
+
+    results: list[dict[str, Any]] = []
+    item_units: list[tuple[int, set]] = []
+    success_count = 0
+    error_count = 0
+
+    for index, document in enumerate(req.documents):
+        try:
+            result = evaluate(compiled, document)
+        except EvaluationFailed as exc:
+            error_count += 1
+            results.append(
+                {
+                    "index": index,
+                    "status": "error",
+                    "result": None,
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "details": exc.details,
+                    },
+                }
+            )
+        except Exception as exc:  # 单项失败隔离，不中止整批
+            error_count += 1
+            results.append(
+                {
+                    "index": index,
+                    "status": "error",
+                    "result": None,
+                    "error": {
+                        "code": "EVALUATION_ERROR",
+                        "message": f"文档求值失败：{exc}",
+                        "details": {},
+                    },
+                }
+            )
+        else:
+            # persist=False：覆盖分析全程不写 evaluations
+            record = _persist_evaluation(
+                conn, ruleset_id, req.version, document, result, persist=False
+            )
+            success_count += 1
+            results.append(
+                {"index": index, "status": "success", "result": record, "error": None}
+            )
+            item_units.append((index, extract_coverage_units(result)))
+
+    summary = summarize_coverage(compiled.evaluation_order, item_units)
+
+    return {
+        "ruleset_id": ruleset_id,
+        "version": req.version,
+        "total": len(req.documents),
+        "success_count": success_count,
+        "error_count": error_count,
+        "results": results,
+        **summary,
     }
 
 

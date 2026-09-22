@@ -21,6 +21,7 @@
 │   │   ├── ast_eval.py    # 基于 AST 的安全表达式求值（沙箱）
 │   │   ├── compiler.py    # 规则编译：引用、依赖、循环、冲突策略校验
 │   │   ├── evaluator.py   # 拓扑排序 + 定点迭代 + 冲突处理
+│   │   ├── coverage.py    # 批量覆盖分析：覆盖单元汇总 + 确定性贪心选样
 │   │   ├── impact.py      # 静态影响分析：反向依赖闭包 + 冲突组联动
 │   │   ├── footprint.py   # 静态输入足迹：doc 访问链 → RFC 6901 JSON Pointer
 │   │   └── diff.py        # 跨版本预演：决策 JSON 路径差异 + 命中规则/冲突摘要
@@ -187,6 +188,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
+| `POST` | `/api/rulesets/{id}/coverage` | 批量覆盖分析（1～100 项，不可变版本）：不落库求值，汇总命中/未命中规则、冲突场景并贪心选出代表文档 |
 | `POST` | `/api/rulesets/{id}/compare` | 发布前预演：同一文档按两个版本求值（不落库），返回两版决策与差异摘要 |
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
 | `GET`  | `/api/rulesets/{id}/evaluation-stats` | 聚合已持久化决策：规则命中率与决策字段统计（支持 `version` / `since` / `until` 筛选） |
@@ -298,6 +300,91 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
 > 注意：批量接口在存在失败项时仍返回 **HTTP 200**，通过每项的
 > `status` / `error` 与顶层计数区分成败；仅当规则集或版本不存在等
 > 整批级问题发生时才返回 4xx。
+
+### 覆盖分析
+
+`POST /api/rulesets/{id}/coverage` 用一批文档检验规则集的**覆盖情况**：
+指定**不可变 `version`（必填）**与 **1～100 份** `documents`，逐项独立
+求值并**全程不写入 evaluations**（成功项记录的 `id` 为空，与
+`evaluate?persist=false` 同构）。规则集不存在 → **404** `NOT_FOUND`；
+版本不存在 → **404** `VERSION_NOT_FOUND`；文档为空数组、超过 100 项、
+缺 `version` 或 `version<1` → **422**。
+
+某项求值失败时与批量接口一致：**隔离在该项**（`status="error"`、按原
+`index` 返回错误结构），不中止整批，HTTP 状态码仍为 200，且**失败项不
+参与覆盖统计与代表选择**。
+
+**覆盖单元（coverage unit）**取自每份成功结果：
+
+- 规则命中单元：`fired_rule_codes` 中每条规则（**含被冲突策略压制者**）；
+- 冲突组压制单元：`conflicts` 中 `priority` / `first_hit` 的组解释，
+  标识为“**组 + 胜出方 + 被压制规则集合**”（被压制规则按
+  `evaluation_order`）；
+- 字段覆盖单元：`collect_all` 的字段级解释（`group` 为 `null`），标识为
+  “**字段 + 胜出方 + 先前写入方**”。
+
+响应汇总：
+
+- `rule_coverage`：该版本**全部规则**（按 `evaluation_order`）的
+  `hit_count`（在成功项 `fired_rule_codes` 中出现的次数）与 `covered`；
+- `unhit_rule_codes`：本批一次都未命中的规则（按 `evaluation_order`）；
+- `observed_conflicts`：去重后的已观察冲突场景及 `observed_count`，
+  每项含 `kind`（`group` / `field`）、`group` / `field`、`winner`、
+  `previous_winner`（仅字段覆盖）与 `suppressed_rule_codes`（仅组压制）；
+  按字段覆盖在前、组压制在后，再按组名/字段名排序；
+- `coverage_unit_count`：所有成功项覆盖单元去重后的总数；
+- `representative_indexes`：**确定性贪心**选出的代表文档下标——每轮在
+  尚未选中的成功项中挑选“新增覆盖单元数最多”的一项，**并列时取最小
+  输入下标**，直至没有任何项还能带来新增单元；零新增的文档（如无任何
+  命中）永不入选，失败项也不参与选择。
+
+请求示例：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/coverage \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "documents": [
+      {"amount": 1500, "customer": {"vip": true}, "region": "north"},
+      {"amount": 80, "region": "north"},
+      {"coupons": ["SAVE10", "SAVE20"]}
+    ]
+  }' | python3 -m json.tool
+```
+
+响应示例（有省略）：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "version": 1,
+  "total": 3,
+  "success_count": 3,
+  "error_count": 0,
+  "results": [
+    {"index": 0, "status": "success", "result": {"id": "", "version": 1}, "error": null},
+    {"index": 1, "status": "success", "result": {"id": ""}, "error": null},
+    {"index": 2, "status": "success", "result": {"id": ""}, "error": null}
+  ],
+  "rule_coverage": [
+    {"code": "is_vip", "hit_count": 1, "covered": true},
+    {"code": "large_order", "hit_count": 1, "covered": true},
+    {"code": "vip_discount", "hit_count": 1, "covered": true}
+  ],
+  "unhit_rule_codes": ["manual_review"],
+  "observed_conflicts": [
+    {"kind": "group", "group": "coupon", "field": null,
+     "winner": "coupon_save10", "previous_winner": null,
+     "suppressed_rule_codes": ["coupon_save20"], "observed_count": 1},
+    {"kind": "group", "group": "discount", "field": null,
+     "winner": "vip_discount", "previous_winner": null,
+     "suppressed_rule_codes": ["large_order"], "observed_count": 1}
+  ],
+  "coverage_unit_count": 9,
+  "representative_indexes": [0, 2]
+}
+```
 
 ### 发布前跨版本预演
 
@@ -644,5 +731,7 @@ pytest -q
 拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合（筛选/排序/零值/非法参数）、
 静态影响分析（反向闭包/层级/多输入去重/冲突组联动/404 与 422）、
 静态输入足迹（doc 访问链提取/RFC 6901 转义/上游闭包 used_by/动态下标 422/404 与 422）、
-跨版本预演（JSON 路径差异归并/空差异/冲突胜出方变化/求值失败单侧隔离/不落库/404 与 422），
+跨版本预演（JSON 路径差异归并/空差异/冲突胜出方变化/求值失败单侧隔离/不落库/404 与 422）、
+批量覆盖分析（规则命中汇总/未命中规则/组压制与字段覆盖单元/贪心代表选样的
+新增最多与并列取下标/失败项隔离且不参与选择/不落库/1～100 项校验/404 与 422），
 以及完整 HTTP 接口。

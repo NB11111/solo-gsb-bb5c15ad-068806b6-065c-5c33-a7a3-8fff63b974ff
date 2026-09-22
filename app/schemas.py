@@ -356,6 +356,78 @@ class EvaluationStatsOut(BaseModel):
     )
 
 
+class CoverageRequest(BaseModel):
+    version: int = Field(
+        ..., ge=1, description="分析所基于的规则版本（必填，不可变快照）"
+    )
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="待评估文档数组，1～100 项",
+    )
+
+
+class RuleCoverageOut(BaseModel):
+    code: str = Field(..., description="规则编码")
+    hit_count: int = Field(
+        ..., description="该规则在成功项 fired_rule_codes 中出现的次数"
+    )
+    covered: bool = Field(..., description="本批文档中是否至少命中一次")
+
+
+class ObservedConflictOut(BaseModel):
+    kind: Literal["group", "field"] = Field(
+        ..., description="group=冲突组压制；field=collect_all 字段覆盖"
+    )
+    group: str | None = Field(None, description="冲突组名；字段覆盖时为 null")
+    field: str | None = Field(None, description="被覆盖的决策字段；组冲突时为 null")
+    winner: str | None = Field(..., description="胜出规则编码")
+    previous_winner: str | None = Field(
+        None, description="字段被覆盖前的写入规则（仅 field 场景）"
+    )
+    suppressed_rule_codes: list[str] = Field(
+        ..., description="被压制规则编码（按 evaluation_order）；字段覆盖为空"
+    )
+    observed_count: int = Field(..., description="该冲突场景在成功项中出现的次数")
+
+
+class CoverageOut(BaseModel):
+    ruleset_id: str
+    version: int = Field(..., description="实际分析的规则版本")
+    total: int = Field(..., description="输入文档总数")
+    success_count: int
+    error_count: int
+    results: list[BatchEvaluationItem] = Field(
+        ...,
+        description=(
+            "逐项求值结果，按输入下标返回；成功项为不落库的完整结果"
+            "（id 为空），失败项仅在 error 中给出原因"
+        ),
+    )
+    rule_coverage: list[RuleCoverageOut] = Field(
+        ...,
+        description="该版本全部规则的命中次数，按 evaluation_order 排列",
+    )
+    unhit_rule_codes: list[str] = Field(
+        ..., description="本批一次都未命中的规则，按 evaluation_order 排列"
+    )
+    observed_conflicts: list[ObservedConflictOut] = Field(
+        ...,
+        description="已观察到的冲突场景（组压制 / 字段覆盖）及出现次数，按类型与名称排序",
+    )
+    coverage_unit_count: int = Field(
+        ..., description="成功项覆盖单元去重后的总数"
+    )
+    representative_indexes: list[int] = Field(
+        ...,
+        description=(
+            "确定性贪心选出的代表项下标：每轮新增覆盖单元最多、"
+            "并列取最小下标；失败项不参与选择"
+        ),
+    )
+
+
 class ErrorResponse(BaseModel):
     code: str
     message: str
